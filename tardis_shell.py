@@ -19,7 +19,13 @@ Supported commands (all end with ; except dot commands):
   CREATE BRANCH <name> FROM <parent>;
   DELETE BRANCH <name>;
   SHOW BRANCHES;
-  USE BRANCH <name>;                    -- sets default branch for this session
+  USE BRANCH <name>;                 -- sets default branch for this session
+
+  CREATE VERSIONED TABLE <name> (col TYPE, ...);
+                                     -- adds tuple_id/branch_id/created/is_deleted
+                                     -- and auto-creates a <name>_visible view
+  CREATE TABLE <name> (...);         -- plain passthrough (non-versioned table)
+  DROP TABLE [IF EXISTS] <name>;     -- drops table + its _visible view if versioned
 
   SELECT ... FROM <table> [VERSION <branch>] [JOIN ... VERSION ...] ...;
   INSERT INTO <table> [VERSION <branch>] [(cols)] VALUES (...);
@@ -28,6 +34,7 @@ Supported commands (all end with ; except dot commands):
 
   .help          show this help
   .verbose       toggle printing of the translated SQL
+  .tables        list versioned tables known to this session
   .quit          exit
 """
 
@@ -85,11 +92,22 @@ VERSIONED_TABLES = {
 }
 
 
-# Regex for `<table> VERSION <branch>` — used to find cross-branch references
-VERSION_CLAUSE_RE = re.compile(
-    r'\b(' + '|'.join(VERSIONED_TABLES.keys()) + r')\s+VERSION\s+(\w+)\b',
-    re.IGNORECASE,
-)
+# Regex for `<table> VERSION <branch>` — used to find cross-branch references.
+# Rebuilt whenever VERSIONED_TABLES changes (CREATE VERSIONED TABLE / DROP).
+def _build_version_clause_re():
+    global VERSION_CLAUSE_RE
+    if VERSIONED_TABLES:
+        VERSION_CLAUSE_RE = re.compile(
+            r'\b(' + '|'.join(re.escape(k) for k in VERSIONED_TABLES.keys())
+            + r')\s+VERSION\s+(\w+)\b',
+            re.IGNORECASE,
+        )
+    else:
+        # Empty alternation would be invalid; match-nothing regex instead
+        VERSION_CLAUSE_RE = re.compile(r'(?!x)x')
+
+VERSION_CLAUSE_RE = None
+_build_version_clause_re()
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +198,9 @@ class TardisShell:
         (r'^\s*\.(\w+)\s*(.*)$',                        'do_dot'),
         (r'^\s*CREATE\s+BRANCH\s+(\w+)\s+FROM\s+(\w+)\s*$',     'do_create_branch'),
         (r'^\s*DELETE\s+BRANCH\s+(\w+)\s*$',            'do_delete_branch'),
+        (r'^\s*CREATE\s+VERSIONED\s+TABLE\s+(\w+)\s*\((.*)\)\s*$',  'do_create_versioned_table'),
+        (r'^\s*CREATE\s+TABLE\b',                       'do_create_table'),
+        (r'^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)', 'do_drop_table'),
         (r'^\s*SHOW\s+BRANCHES\s*$',                    'do_show_branches'),
         (r'^\s*USE\s+BRANCH\s+(\w+)\s*$',               'do_use_branch'),
         (r'^\s*SELECT\b',                               'do_select'),
@@ -208,6 +229,13 @@ class TardisShell:
         if cmd == 'verbose':
             self.verbose = not self.verbose
             print(f"    verbose: {'ON' if self.verbose else 'OFF'}")
+        elif cmd == 'tables':
+            if not VERSIONED_TABLES:
+                print("    (no versioned tables registered)")
+                return
+            for name, meta in VERSIONED_TABLES.items():
+                print(f"    {name}: {', '.join(meta['user_columns'])}  "
+                      f"-> view {meta['visible_view']}")
         elif cmd == 'help':
             print(__doc__)
         else:
@@ -269,6 +297,167 @@ class TardisShell:
         self.current_branch = name
         print(f"    Default branch: {name}")
 
+    # -- Table management (CREATE / DROP) -----------------------------------
+
+    # MySQL keywords that indicate a table-level constraint rather than a
+    # column definition. Used to skip them when extracting column names.
+    _CONSTRAINT_KW_RE = re.compile(
+        r'^(PRIMARY\s+KEY|KEY\b|INDEX\b|UNIQUE(\s+KEY)?(\s*\()?|'
+        r'FOREIGN\s+KEY|CONSTRAINT\b|CHECK\s*\(|FULLTEXT\b|SPATIAL\b)',
+        re.IGNORECASE,
+    )
+
+    _RESERVED_COLS = {'branch_id', 'created', 'is_deleted'}
+
+    def do_create_versioned_table(self, sql, m):
+        """CREATE VERSIONED TABLE <n> (col TYPE, ...) — adds versioning
+        columns, composite PK, FK to branches, and creates the _visible view."""
+        table_name = m.group(1).lower()
+        column_defs_raw = m.group(2).strip()
+
+        if table_name in VERSIONED_TABLES:
+            print(f"    '{table_name}' is already a registered versioned table")
+            return
+
+        # Parse user column names and validate
+        entries = self._split_top_level(column_defs_raw)
+        user_cols = []
+        cleaned_defs = []
+        for entry in entries:
+            entry = entry.strip()
+            if not entry:
+                continue
+            if self._CONSTRAINT_KW_RE.match(entry):
+                print("    Error: table-level constraints are not allowed in "
+                      "CREATE VERSIONED TABLE (the versioning layer manages "
+                      "the primary key and branch FK).")
+                print(f"    Offending clause: {entry}")
+                return
+            first = entry.split(None, 1)[0].strip('`"')
+            low = first.lower()
+            if low == 'tuple_id':
+                # User declared tuple_id; allow but skip injecting our own
+                pass
+            elif low in self._RESERVED_COLS:
+                print(f"    Error: '{first}' is a reserved versioning column name")
+                return
+            user_cols.append(first)
+            cleaned_defs.append(entry)
+
+        if not user_cols:
+            print("    Error: no columns specified")
+            return
+
+        # Inject tuple_id automatically if the user didn't declare it
+        has_tuple_id = any(c.lower() == 'tuple_id' for c in user_cols)
+        if not has_tuple_id:
+            cleaned_defs.insert(0, 'tuple_id INT UNSIGNED NOT NULL')
+            user_cols.insert(0, 'tuple_id')
+
+        fk_name = f"{table_name}_branch_fk"
+        body = ",\n    ".join(cleaned_defs)
+        create_sql = (
+            f"CREATE TABLE {table_name} (\n"
+            f"    {body},\n"
+            f"    branch_id INT UNSIGNED NOT NULL,\n"
+            f"    created DATETIME NOT NULL,\n"
+            f"    is_deleted TINYINT(1) NOT NULL DEFAULT 0,\n"
+            f"    PRIMARY KEY (tuple_id, branch_id, created),\n"
+            f"    KEY {fk_name} (branch_id),\n"
+            f"    CONSTRAINT {fk_name} FOREIGN KEY (branch_id) "
+            f"REFERENCES branches(branch_id)\n"
+            f") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
+            f"COLLATE=utf8mb4_0900_ai_ci"
+        )
+
+        visible_view = f"{table_name}_visible"
+        select_list = ', '.join(user_cols)
+        view_sql = (
+            f"CREATE VIEW {visible_view} AS\n"
+            f"SELECT {select_list},\n"
+            f"       branch_id AS _source_branch, created AS _version_ts\n"
+            f"FROM (\n"
+            f"    SELECT t.*,\n"
+            f"           ROW_NUMBER() OVER (\n"
+            f"               PARTITION BY t.tuple_id\n"
+            f"               ORDER BY t.created DESC\n"
+            f"           ) AS _rn\n"
+            f"    FROM {table_name} t\n"
+            f"    JOIN branch_lineage l ON t.branch_id = l.branch_id\n"
+            f"    WHERE l.fork_cutoff IS NULL OR t.created < l.fork_cutoff\n"
+            f") ranked\n"
+            f"WHERE _rn = 1 AND is_deleted = FALSE"
+        )
+
+        self._log(create_sql)
+        cur = self.conn.cursor()
+        try:
+            cur.execute(create_sql)
+            self._log(view_sql)
+            try:
+                cur.execute(view_sql)
+            except mysql.connector.Error as e:
+                # Table was created but view failed; clean up to stay consistent
+                cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+                self.conn.commit()
+                print(f"    View creation failed, rolled back table: {e}")
+                return
+            self.conn.commit()
+        except mysql.connector.Error as e:
+            print(f"    MySQL error: {e}")
+            return
+        finally:
+            cur.close()
+
+        VERSIONED_TABLES[table_name] = {
+            'full_columns': user_cols + ['branch_id', 'created', 'is_deleted'],
+            'user_columns': list(user_cols),
+            'visible_view': visible_view,
+        }
+        _build_version_clause_re()
+
+        print(f"    Created versioned table '{table_name}'")
+        print(f"    View '{visible_view}' ready")
+        print(f"    User columns: {', '.join(user_cols)}")
+
+    def do_create_table(self, sql, m):
+        """Plain CREATE TABLE passthrough — no versioning."""
+        cur = self.conn.cursor()
+        try:
+            self._log(sql)
+            cur.execute(sql)
+            self.conn.commit()
+            print("    Table created (non-versioned)")
+        except mysql.connector.Error as e:
+            print(f"    MySQL error: {e}")
+        finally:
+            cur.close()
+
+    def do_drop_table(self, sql, m):
+        """DROP TABLE — also drops the _visible view and unregisters the
+        table from VERSIONED_TABLES if it was a versioned one."""
+        table_name = m.group(1).lower()
+        cur = self.conn.cursor()
+        try:
+            if table_name in VERSIONED_TABLES:
+                view = VERSIONED_TABLES[table_name]['visible_view']
+                drop_view = f"DROP VIEW IF EXISTS {view}"
+                self._log(drop_view)
+                cur.execute(drop_view)
+            self._log(sql)
+            cur.execute(sql)
+            self.conn.commit()
+            if table_name in VERSIONED_TABLES:
+                del VERSIONED_TABLES[table_name]
+                _build_version_clause_re()
+                print(f"    Dropped versioned table '{table_name}' (and its view)")
+            else:
+                print(f"    Dropped '{table_name}'")
+        except mysql.connector.Error as e:
+            print(f"    MySQL error: {e}")
+        finally:
+            cur.close()
+
     # -- SELECT -------------------------------------------------------------
 
     def do_select(self, sql, m):
@@ -297,7 +486,9 @@ class TardisShell:
     def _rewrite_bare_tables_to_views(self, sql):
         """For bare `FROM employees` / `JOIN departments` (no VERSION clause),
         point at the _visible view so the current branch context applies."""
-        table_alt = '|'.join(VERSIONED_TABLES.keys())
+        if not VERSIONED_TABLES:
+            return sql
+        table_alt = '|'.join(re.escape(k) for k in VERSIONED_TABLES.keys())
         # Don't rewrite if it's already the _visible view or a temp table
         for kw in ('FROM', 'JOIN'):
             pat = re.compile(
