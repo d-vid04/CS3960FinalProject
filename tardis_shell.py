@@ -26,6 +26,11 @@ Supported commands (all end with ; except dot commands):
                                      -- and auto-creates a <name>_visible view
   CREATE TABLE <name> (...);         -- plain passthrough (non-versioned table)
   DROP TABLE [IF EXISTS] <name>;     -- drops table + its _visible view if versioned
+  ALTER TABLE <name> <action>, ...;  -- for versioned tables, also refreshes the
+                                     -- _visible view. Reserved versioning columns
+                                     -- (tuple_id/branch_id/created/is_deleted)
+                                     -- cannot be dropped or renamed, and versioned
+                                     -- tables cannot be RENAMEd.
 
   SELECT ... FROM <table> [VERSION <branch>] [JOIN ... VERSION ...] ...;
   INSERT INTO <table> [VERSION <branch>] [(cols)] VALUES (...);
@@ -201,6 +206,7 @@ class TardisShell:
         (r'^\s*CREATE\s+VERSIONED\s+TABLE\s+(\w+)\s*\((.*)\)\s*$',  'do_create_versioned_table'),
         (r'^\s*CREATE\s+TABLE\b',                       'do_create_table'),
         (r'^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)', 'do_drop_table'),
+        (r'^\s*ALTER\s+TABLE\s+(\w+)\b',                'do_alter_table'),
         (r'^\s*SHOW\s+BRANCHES\s*$',                    'do_show_branches'),
         (r'^\s*USE\s+BRANCH\s+(\w+)\s*$',               'do_use_branch'),
         (r'^\s*SELECT\b',                               'do_select'),
@@ -371,23 +377,7 @@ class TardisShell:
         )
 
         visible_view = f"{table_name}_visible"
-        select_list = ', '.join(user_cols)
-        view_sql = (
-            f"CREATE VIEW {visible_view} AS\n"
-            f"SELECT {select_list},\n"
-            f"       branch_id AS _source_branch, created AS _version_ts\n"
-            f"FROM (\n"
-            f"    SELECT t.*,\n"
-            f"           ROW_NUMBER() OVER (\n"
-            f"               PARTITION BY t.tuple_id\n"
-            f"               ORDER BY t.created DESC\n"
-            f"           ) AS _rn\n"
-            f"    FROM {table_name} t\n"
-            f"    JOIN branch_lineage l ON t.branch_id = l.branch_id\n"
-            f"    WHERE l.fork_cutoff IS NULL OR t.created < l.fork_cutoff\n"
-            f") ranked\n"
-            f"WHERE _rn = 1 AND is_deleted = FALSE"
-        )
+        view_sql = self._build_visible_view_sql(table_name, visible_view, user_cols)
 
         self._log(create_sql)
         cur = self.conn.cursor()
@@ -433,6 +423,26 @@ class TardisShell:
         finally:
             cur.close()
 
+    @staticmethod
+    def _build_visible_view_sql(table_name, visible_view, user_cols):
+        select_list = ', '.join(user_cols)
+        return (
+            f"CREATE VIEW {visible_view} AS\n"
+            f"SELECT {select_list},\n"
+            f"       branch_id AS _source_branch, created AS _version_ts\n"
+            f"FROM (\n"
+            f"    SELECT t.*,\n"
+            f"           ROW_NUMBER() OVER (\n"
+            f"               PARTITION BY t.tuple_id\n"
+            f"               ORDER BY t.created DESC\n"
+            f"           ) AS _rn\n"
+            f"    FROM {table_name} t\n"
+            f"    JOIN branch_lineage l ON t.branch_id = l.branch_id\n"
+            f"    WHERE l.fork_cutoff IS NULL OR t.created < l.fork_cutoff\n"
+            f") ranked\n"
+            f"WHERE _rn = 1 AND is_deleted = FALSE"
+        )
+
     def do_drop_table(self, sql, m):
         """DROP TABLE — also drops the _visible view and unregisters the
         table from VERSIONED_TABLES if it was a versioned one."""
@@ -457,6 +467,112 @@ class TardisShell:
             print(f"    MySQL error: {e}")
         finally:
             cur.close()
+
+    # Matches DROP/CHANGE/RENAME COLUMN targeting a reserved versioning column.
+    # MODIFY is allowed (pure type change, no rename) so users can widen types.
+    _ALTER_RESERVED_RE = re.compile(
+        r'\b(?:DROP\s+(?:COLUMN\s+)?|CHANGE(?:\s+COLUMN)?\s+|RENAME\s+COLUMN\s+)'
+        r'`?(tuple_id|branch_id|created|is_deleted)`?\b',
+        re.IGNORECASE,
+    )
+    # Also block CHANGE/RENAME COLUMN ... TO <reserved>, to prevent collisions.
+    _ALTER_RESERVED_TO_RE = re.compile(
+        r'\bTO\s+`?(tuple_id|branch_id|created|is_deleted)`?\b',
+        re.IGNORECASE,
+    )
+    _ALTER_RENAME_TABLE_RE = re.compile(
+        r'\bRENAME\s+(?:TO|AS)\b', re.IGNORECASE,
+    )
+
+    def do_alter_table(self, sql, m):
+        """ALTER TABLE — passthrough for non-versioned tables; for versioned
+        tables, execute the ALTER and then refresh the _visible view and the
+        shell's column metadata from information_schema."""
+        table_name = m.group(1).lower()
+
+        if table_name not in VERSIONED_TABLES:
+            cur = self.conn.cursor()
+            try:
+                self._log(sql)
+                cur.execute(sql)
+                self.conn.commit()
+                print(f"    Altered '{table_name}' (non-versioned)")
+            except mysql.connector.Error as e:
+                print(f"    MySQL error: {e}")
+            finally:
+                cur.close()
+            return
+
+        # Versioned: guard the columns + name the shell manages
+        hit = self._ALTER_RESERVED_RE.search(sql)
+        if hit:
+            print(f"    Error: cannot drop/rename reserved versioning column "
+                  f"'{hit.group(1)}'. Use MODIFY to change its type only.")
+            return
+        hit = self._ALTER_RESERVED_TO_RE.search(sql)
+        if hit:
+            print(f"    Error: '{hit.group(1)}' is a reserved versioning "
+                  f"column name; cannot rename a column to it.")
+            return
+        if self._ALTER_RENAME_TABLE_RE.search(sql):
+            print("    Error: renaming a versioned table is not supported "
+                  "(would desync the _visible view).")
+            return
+
+        meta = VERSIONED_TABLES[table_name]
+        visible_view = meta['visible_view']
+
+        cur = self.conn.cursor()
+        try:
+            self._log(sql)
+            cur.execute(sql)
+
+            # Re-read the table's columns and rebuild user_cols in definition order
+            cur.execute(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                "ORDER BY ORDINAL_POSITION",
+                (table_name,),
+            )
+            all_cols = [r[0] for r in cur.fetchall()]
+            reserved = {'branch_id', 'created', 'is_deleted'}
+            user_cols = [c for c in all_cols if c not in reserved]
+
+            if 'tuple_id' not in user_cols:
+                # Shouldn't happen given the guard above, but fail loudly rather
+                # than produce a broken view.
+                raise RuntimeError(
+                    "tuple_id column is missing after ALTER; view not rebuilt"
+                )
+
+            drop_view = f"DROP VIEW IF EXISTS {visible_view}"
+            self._log(drop_view)
+            cur.execute(drop_view)
+
+            view_sql = self._build_visible_view_sql(
+                table_name, visible_view, user_cols
+            )
+            self._log(view_sql)
+            cur.execute(view_sql)
+            self.conn.commit()
+        except mysql.connector.Error as e:
+            print(f"    MySQL error: {e}")
+            self.conn.rollback()
+            return
+        except Exception as e:
+            print(f"    Error: {type(e).__name__}: {e}")
+            self.conn.rollback()
+            return
+        finally:
+            cur.close()
+
+        VERSIONED_TABLES[table_name] = {
+            'full_columns': user_cols + ['branch_id', 'created', 'is_deleted'],
+            'user_columns': user_cols,
+            'visible_view': visible_view,
+        }
+        print(f"    Altered versioned table '{table_name}' (view refreshed)")
+        print(f"    User columns: {', '.join(user_cols)}")
 
     # -- SELECT -------------------------------------------------------------
 
