@@ -19,6 +19,7 @@ mysql -u root -h 127.0.0.1 -p CS3960_project < views.sql
 ## Run
 
 ```bash
+brew services start mysql
 python3 tardis_shell.py --database YOUR_DB [--user USER] [--host HOST] [-v]
 ```
 
