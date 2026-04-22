@@ -123,6 +123,44 @@ class TardisShell:
         self.conn = conn
         self.current_branch = 'master'
         self.verbose = verbose
+        self._reconcile_versioned_tables()
+
+    # -- startup reconciliation --------------------------------------------
+
+    def _reconcile_versioned_tables(self):
+        """Rebuild VERSIONED_TABLES from the live database so tables created
+        in a prior session are re-registered. Any base table with all four
+        versioning columns (tuple_id/branch_id/created/is_deleted) qualifies."""
+        required = {'tuple_id', 'branch_id', 'created', 'is_deleted'}
+        reserved = {'branch_id', 'created', 'is_deleted'}
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                "SELECT c.TABLE_NAME, c.COLUMN_NAME "
+                "FROM information_schema.COLUMNS c "
+                "JOIN information_schema.TABLES t "
+                "  ON c.TABLE_SCHEMA = t.TABLE_SCHEMA "
+                " AND c.TABLE_NAME   = t.TABLE_NAME "
+                "WHERE c.TABLE_SCHEMA = DATABASE() "
+                "  AND t.TABLE_TYPE   = 'BASE TABLE' "
+                "ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION"
+            )
+            cols_by_table = {}
+            for tbl, col in cur.fetchall():
+                cols_by_table.setdefault(tbl, []).append(col)
+        finally:
+            cur.close()
+
+        for tbl, cols in cols_by_table.items():
+            if not required.issubset(set(cols)):
+                continue
+            user_cols = [c for c in cols if c not in reserved]
+            VERSIONED_TABLES[tbl] = {
+                'full_columns': user_cols + ['branch_id', 'created', 'is_deleted'],
+                'user_columns': user_cols,
+                'visible_view': f"{tbl}_visible",
+            }
+        _build_version_clause_re()
 
     # -- small helpers ------------------------------------------------------
 
