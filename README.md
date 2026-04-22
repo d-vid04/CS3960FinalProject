@@ -148,4 +148,4 @@ DELETE FROM <table> [VERSION <branch>] [WHERE ...];
 | `.tables`   | List versioned tables known to this session  |
 | `.quit`     | Exit                                         |
 
-## disclaimer: some of the tardis_shell.py and views.sql code was created with the assistance of generative AI.
+### disclaimer: some of the tardis_shell.py and views.sql code was created with the assistance of generative AI.
