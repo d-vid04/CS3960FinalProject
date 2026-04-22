@@ -5,11 +5,32 @@ Project based off of TardisDB:
 
 ## Prerequisites
 
+### MySQL Server
+
+**macOS (using Homebrew):**
+```bash
+brew install mysql
+brew services start mysql
+```
+
+**Windows (using Chocolatey):**
+```bash
+choco install mysql
+# Then start the MySQL service via Services app or Command Prompt:
+net start MySQL80
+```
+
+Alternatively, download MySQL Community Server from <https://dev.mysql.com/downloads/mysql/> and follow the installer.
+
+### Python Dependencies
+
 ```bash
 pip install mysql-connector-python
 ```
 
-Then run the schema and views against your database:
+### Set up Database
+
+After MySQL is running, create the database and load the schema:
 
 ```bash
 mysql -u root -h 127.0.0.1 -p CS3960_project < schema.sql
@@ -19,7 +40,6 @@ mysql -u root -h 127.0.0.1 -p CS3960_project < views.sql
 ## Run
 
 ```bash
-brew services start mysql
 python3 tardis_shell.py --database YOUR_DB [--user USER] [--host HOST] [-v]
 ```
 
