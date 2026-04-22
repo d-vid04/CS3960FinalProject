@@ -186,6 +186,19 @@ END //
 CREATE PROCEDURE delete_branch(IN p_name VARCHAR(64))
 BEGIN
     DECLARE v_branch_id INT UNSIGNED;
+    DECLARE v_done      INT DEFAULT FALSE;
+    DECLARE v_table     VARCHAR(64);
+
+    -- Cursor over every table that has a FK to branches(branch_id),
+    -- so dynamically-created versioned tables are cleaned up too.
+    DECLARE fk_cur CURSOR FOR
+        SELECT DISTINCT TABLE_NAME
+        FROM information_schema.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND REFERENCED_TABLE_NAME = 'branches'
+          AND REFERENCED_COLUMN_NAME = 'branch_id'
+          AND TABLE_NAME != 'branches';
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
 
     SELECT branch_id INTO v_branch_id
     FROM branches WHERE branch_name = p_name;
@@ -205,10 +218,22 @@ BEGIN
             SET MESSAGE_TEXT = 'Branch has child branches; delete those first';
     END IF;
 
-    DELETE FROM paystubs    WHERE branch_id = v_branch_id;
-    DELETE FROM departments WHERE branch_id = v_branch_id;
-    DELETE FROM employees   WHERE branch_id = v_branch_id;
-    DELETE FROM branches    WHERE branch_id = v_branch_id;
+    OPEN fk_cur;
+    purge_loop: LOOP
+        FETCH fk_cur INTO v_table;
+        IF v_done THEN
+            LEAVE purge_loop;
+        END IF;
+        SET @sql := CONCAT(
+            'DELETE FROM `', v_table, '` WHERE branch_id = ', v_branch_id
+        );
+        PREPARE stmt FROM @sql;
+        EXECUTE stmt;
+        DEALLOCATE PREPARE stmt;
+    END LOOP;
+    CLOSE fk_cur;
+
+    DELETE FROM branches WHERE branch_id = v_branch_id;
 END //
 
 DELIMITER ;

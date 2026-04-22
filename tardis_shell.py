@@ -270,6 +270,25 @@ class TardisShell:
         name = m.group(1)
         cur = self.conn.cursor()
         try:
+            bid = self._branch_id(name)
+
+            # The stored procedure only purges the original hardcoded tables;
+            # any table added via CREATE VERSIONED TABLE has its own FK to
+            # branches and must be cleaned up here, or DELETE on branches
+            # will hit a FK violation.
+            cur.execute(
+                "SELECT DISTINCT TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND REFERENCED_TABLE_NAME = 'branches' "
+                "AND REFERENCED_COLUMN_NAME = 'branch_id' "
+                "AND TABLE_NAME != 'branches'"
+            )
+            fk_tables = [r[0] for r in cur.fetchall()]
+            for t in fk_tables:
+                delete_sql = f"DELETE FROM `{t}` WHERE branch_id = %s"
+                self._log(delete_sql, (bid,))
+                cur.execute(delete_sql, (bid,))
+
             self._log("CALL delete_branch(%s);", (name,))
             cur.execute("CALL delete_branch(%s)", (name,))
             while cur.nextset():
