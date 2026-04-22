@@ -5,6 +5,27 @@ Project based off of TardisDB:
 
 ## Prerequisites
 
+### Python 3
+
+**macOS (using Homebrew):**
+```bash
+brew install python
+```
+
+If you don't have Homebrew, install it from <https://brew.sh/>. Alternatively, download from <https://www.python.org/downloads/macos/>.
+
+**Windows (using Chocolatey):**
+```bash
+choco install python
+```
+
+Alternatively, download from <https://www.python.org/downloads/windows/> and make sure to check "Add Python to PATH" during installation.
+
+Verify the install:
+```bash
+python3 --version
+```
+
 ### MySQL Server
 
 **macOS (using Homebrew):**
@@ -30,7 +51,20 @@ pip install mysql-connector-python
 
 ### Set up Database
 
-After MySQL is running, create the database and load the schema:
+After MySQL is running, log in and create the database:
+
+```bash
+mysql -u root -h 127.0.0.1 -p
+```
+
+Then at the `mysql>` prompt:
+
+```sql
+CREATE DATABASE CS3960_project;
+EXIT;
+```
+
+Now load the schema and views into the database:
 
 ```bash
 mysql -u root -h 127.0.0.1 -p CS3960_project < schema.sql
@@ -113,3 +147,5 @@ DELETE FROM <table> [VERSION <branch>] [WHERE ...];
 | `.verbose`  | Toggle printing of the translated SQL        |
 | `.tables`   | List versioned tables known to this session  |
 | `.quit`     | Exit                                         |
+
+## disclaimer: some of the tardis_shell.py and views.sql code was created with the assistance of generative AI.
